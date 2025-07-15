@@ -571,12 +571,12 @@ def main():
     st.sidebar.title("📋 Setup Status")
     
     # Check if required packages are installed
-    try:
-        import sounddevice as sd
-        st.sidebar.success("✅ sounddevice installed")
-    except ImportError:
-        st.sidebar.error("❌ sounddevice not installed")
-        st.sidebar.code("pip install sounddevice")
+    # try:
+    #     import sounddevice as sd
+    #     st.sidebar.success("✅ sounddevice installed")
+    # except ImportError:
+    #     st.sidebar.error("❌ sounddevice not installed")
+    #     st.sidebar.code("pip install sounddevice")
     
     try:
         import pydub
