@@ -23,6 +23,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import LabelEncoder
 from collections import defaultdict
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 
 # Load environment variables
 load_dotenv()
