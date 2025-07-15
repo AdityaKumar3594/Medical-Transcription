@@ -1,0 +1,15 @@
+streamlit
+speechrecognition
+python-dotenv
+tempfile
+pydub
+sounddevice
+numpy
+scipy
+openai
+PyPDF2
+torch
+transformers
+scikit-learn
+matplotlib
+seaborn

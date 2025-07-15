@@ -1,6 +1,5 @@
 import streamlit as st
 import speech_recognition as sr
-import google.generativeai as genai
 import os
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2" 
