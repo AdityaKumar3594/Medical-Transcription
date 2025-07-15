@@ -8,7 +8,7 @@ import tempfile
 import time
 import io
 from pydub import AudioSegment
-import sounddevice as sd
+# import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wavfile
 from openai import OpenAI
