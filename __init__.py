@@ -8,20 +8,20 @@ import tempfile
 import time
 import io
 from pydub import AudioSegment
-# import sounddevice as sd
+import sounddevice as sd
 import numpy as np
-import scipy.io.wavfile as wavfile
+# import scipy.io.wavfile as wavfile
 from openai import OpenAI
 import PyPDF2
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+# from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import re
 import warnings
 warnings.filterwarnings("ignore")
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import LabelEncoder
+# from sklearn.preprocessing import LabelEncoder
 from collections import defaultdict
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -36,6 +36,18 @@ DURATION = 10  # seconds
 
 # Medical Models Configuration
 MEDICAL_MODELS = {
+    "ZeroShot-DeBERTa": {
+        "model_name": "MoritzLaurer/deberta-v3-large-zeroshot-v2.0",
+        "description": "High-accuracy DeBERTa-v3 large zero-shot classifier (NLI).",
+        "type": "zero-shot",
+        "task": "zero_shot"
+    },
+    "ZeroShot-BART": {
+        "model_name": "facebook/bart-large-mnli",
+        "description": "Zero-shot NLI-based classifier; often strong out-of-the-box for label sets.",
+        "type": "zero-shot",
+        "task": "zero_shot"
+    },
     "ClinicalBERT": {
         "model_name": "medicalai/ClinicalBERT",
         "description": "BERT model pretrained on clinical notes (MIMIC-III), strong for clinical text classification.",
@@ -215,9 +227,8 @@ def initialize_session_state():
         st.session_state.selected_model = None
     if 'classification_history' not in st.session_state:
         st.session_state.classification_history = []
-    if 'label_encoder' not in st.session_state:
-        st.session_state.label_encoder = LabelEncoder()
-        st.session_state.label_encoder.fit(MEDICAL_CATEGORIES + ["Unknown"])
+    if 'labels' not in st.session_state:
+        st.session_state.labels = MEDICAL_CATEGORIES + ["Unknown"]
     if 'loaded_models' not in st.session_state:
         st.session_state.loaded_models = {}
 
@@ -246,7 +257,17 @@ def load_medical_model(model_name):
     try:
         model_info = MEDICAL_MODELS[model_name]
         
-        # Load tokenizer and model
+        # Zero-shot pipeline
+        if model_info["task"] == "zero_shot":
+            use_gpu = torch.cuda.is_available()
+            zshot = pipeline(
+                "zero-shot-classification",
+                model=model_info["model_name"],
+                device=0 if use_gpu else -1,
+            )
+            return zshot, None, None
+        
+        # Load tokenizer and model for sequence classification
         tokenizer = AutoTokenizer.from_pretrained(model_info["model_name"])
         model = AutoModelForSequenceClassification.from_pretrained(
             model_info["model_name"], 
@@ -254,14 +275,37 @@ def load_medical_model(model_name):
             ignore_mismatched_sizes=True
         )
         
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            model = model.to("cuda")
+        
         return model, tokenizer, None
     except Exception as e:
         st.error(f"Failed to load model {model_name}: {str(e)}")
         return None, None, str(e)
 
-def create_medical_classifier(model, tokenizer):
-    """Create a medical classifier using the loaded model"""
+def create_medical_classifier(model_or_pipeline, tokenizer, task):
+    """Create a medical classifier using the loaded model or zero-shot pipeline"""
+    if task == "zero_shot":
+        def classify_text(text):
+            result = model_or_pipeline(
+                text,
+                candidate_labels=MEDICAL_CATEGORIES,
+                multi_label=False, # Changed to False for higher accuracy
+                hypothesis_template="This text is about the category: {}. Is this true?"
+            )
+            # Map scores to predictions sorted descending
+            labels = result.get("labels", [])
+            scores = result.get("scores", [])
+            predictions = [
+                {"category": label, "confidence": float(score)}
+                for label, score in zip(labels, scores)
+            ]
+            return predictions
+        return classify_text
+
     def classify_text(text):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         # Tokenize input
         inputs = tokenizer(
             text, 
@@ -271,9 +315,12 @@ def create_medical_classifier(model, tokenizer):
             padding=True
         )
         
+        if device == "cuda":
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+        
         # Get model outputs
         with torch.no_grad():
-            outputs = model(**inputs)
+            outputs = model_or_pipeline(**inputs)
         
         # Get logits and probabilities
         logits = outputs.logits
@@ -348,12 +395,18 @@ def perform_classification(transcript, model_name):
                 model, tokenizer, error = load_medical_model(model_name)
                 if error:
                     return None, None, error
-                st.session_state.loaded_models[model_name] = (model, tokenizer)
+                task = MEDICAL_MODELS[model_name]["task"]
+                st.session_state.loaded_models[model_name] = (model, tokenizer, task)
         
-        model, tokenizer = st.session_state.loaded_models[model_name]
+        loaded = st.session_state.loaded_models[model_name]
+        if isinstance(loaded, tuple) and len(loaded) == 3:
+            model, tokenizer, task = loaded
+        else:
+            model, tokenizer = loaded
+            task = MEDICAL_MODELS[model_name].get("task", "feature_extraction")
         
         # Create classifier
-        classifier = create_medical_classifier(model, tokenizer)
+        classifier = create_medical_classifier(model, tokenizer, task)
         
         # Perform classification
         predictions = classifier(processed_text)
@@ -366,7 +419,7 @@ def perform_classification(transcript, model_name):
         return None, None, f"Classification error: {str(e)}"
 
 def calculate_metrics(history):
-    """Calculate real performance metrics from classification history"""
+    """Calculate real performance metrics from classification history using NumPy"""
     if not history:
         return {}
     
@@ -374,32 +427,41 @@ def calculate_metrics(history):
     ground_truths = [item['ground_truth'] for item in history]
     predictions = [item['top_prediction'] for item in history]
     
-    # Encode labels
-    try:
-        encoded_truths = st.session_state.label_encoder.transform(ground_truths)
-        encoded_preds = st.session_state.label_encoder.transform(predictions)
-    except ValueError as e:
-        st.error(f"Label encoding error: {e}")
-        return {}
+    labels = st.session_state.get('labels', MEDICAL_CATEGORIES + ["Unknown"])
+    label_to_index = {label: idx for idx, label in enumerate(labels)}
     
-    # Calculate metrics
-    accuracy = accuracy_score(encoded_truths, encoded_preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        encoded_truths, encoded_preds, average='weighted', zero_division=0
-    )
-    
-    # Create confusion matrix data
-    labels = list(st.session_state.label_encoder.classes_)
+    # Build confusion matrix
     cm = np.zeros((len(labels), len(labels)), dtype=int)
-    
-    # Count occurrences
     for gt, pred in zip(ground_truths, predictions):
-        try:
-            gt_idx = labels.index(gt)
-            pred_idx = labels.index(pred)
-            cm[gt_idx][pred_idx] += 1
-        except ValueError:
-            continue  # Skip if label not found
+        if gt in label_to_index and pred in label_to_index:
+            cm[label_to_index[gt], label_to_index[pred]] += 1
+    
+    total = cm.sum()
+    accuracy = float(np.trace(cm)) / total if total > 0 else 0.0
+    
+    # Weighted precision/recall/f1
+    precisions = []
+    recalls = []
+    f1s = []
+    supports = []
+    for i in range(len(labels)):
+        tp = cm[i, i]
+        fp = cm[:, i].sum() - tp
+        fn = cm[i, :].sum() - tp
+        support = cm[i, :].sum()
+        precision_i = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall_i = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1_i = (2 * precision_i * recall_i / (precision_i + recall_i)) if (precision_i + recall_i) > 0 else 0.0
+        precisions.append(precision_i)
+        recalls.append(recall_i)
+        f1s.append(f1_i)
+        supports.append(support)
+    
+    supports = np.array(supports)
+    weight = supports / supports.sum() if supports.sum() > 0 else np.zeros_like(supports, dtype=float)
+    precision = float(np.sum(np.array(precisions) * weight))
+    recall = float(np.sum(np.array(recalls) * weight))
+    f1 = float(np.sum(np.array(f1s) * weight))
     
     return {
         "accuracy": accuracy,
@@ -459,9 +521,17 @@ def record_audio_sounddevice(duration=5):
         return None, f"Recording error: {str(e)}"
 
 def save_audio_array_to_wav(audio_data, filename):
-    """Save numpy audio array to WAV file"""
+    """Save numpy audio array to WAV file using Python wave module (no ffmpeg dependency)"""
     try:
-        wavfile.write(filename, SAMPLE_RATE, audio_data)
+        import wave
+        # Ensure int16 format
+        if audio_data.dtype != np.int16:
+            audio_data = (audio_data * np.iinfo(np.int16).max).astype(np.int16)
+        with wave.open(filename, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_data.tobytes())
         return True
     except Exception as e:
         st.error(f"Error saving audio: {e}")
@@ -570,14 +640,6 @@ def main():
     # Check dependencies
     st.sidebar.title("📋 Setup Status")
     
-    # Check if required packages are installed
-    # try:
-    #     import sounddevice as sd
-    #     st.sidebar.success("✅ sounddevice installed")
-    # except ImportError:
-    #     st.sidebar.error("❌ sounddevice not installed")
-    #     st.sidebar.code("pip install sounddevice")
-    
     try:
         import pydub
         st.sidebar.success("✅ pydub installed")
@@ -586,14 +648,18 @@ def main():
         st.sidebar.code("pip install pydub")
     
     try:
-        import torch
+        import torch as _torch
         st.sidebar.success("✅ torch installed")
+        if _torch.cuda.is_available():
+            st.sidebar.info("🟢 CUDA GPU detected")
+        else:
+            st.sidebar.info("⚪ CPU mode")
     except ImportError:
         st.sidebar.error("❌ torch not installed")
         st.sidebar.code("pip install torch")
     
     try:
-        import transformers
+        import transformers as _transformers
         st.sidebar.success("✅ transformers installed")
     except ImportError:
         st.sidebar.error("❌ transformers not installed")
@@ -624,7 +690,8 @@ def main():
         )
         
         if uploaded_file is not None:
-            st.audio(uploaded_file, format='audio/wav')
+            audio_mime = uploaded_file.type or "audio/wav"
+            st.audio(uploaded_file, format=audio_mime)
             
             if st.button("🔄 Transcribe Audio File"):
                 with st.spinner("Processing audio file..."):
@@ -995,8 +1062,8 @@ def main():
         1. **Install required packages:**
         ```bash
         pip install streamlit speechrecognition google-generativeai python-dotenv 
-        pip install sounddevice pydub scipy numpy openai PyPDF2
-        pip install torch transformers datasets scikit-learn matplotlib seaborn
+        pip install sounddevice pydub numpy openai PyPDF2
+        pip install torch transformers matplotlib seaborn
         ```
         
         2. **For audio format support:**
@@ -1027,7 +1094,7 @@ def main():
         - ✅ Real microphone recording
         - ✅ Speech-to-text transcription
         - ✅ AI-powered Q&A (with OpenRouter)
-        - ✅ Medical classification with transformer models
+        - ✅ Medical classification with transformer models (now includes ZeroShot-BART and DeBERTa)
         - ✅ Performance metrics and confusion matrix
         - ✅ Transcript editing
         - ✅ Classification and Q&A history
@@ -1036,6 +1103,7 @@ def main():
         - **ClinicalBERT**: Clinical notes specialist
         - **PubMedBERT**: PubMed abstracts focused
         - **ZeroShot-BART**: General zero-shot classification
+        - **ZeroShot-DeBERTa**: High-accuracy zero-shot classification
         
         ### Troubleshooting:
         - **No audio devices**: Check microphone permissions
